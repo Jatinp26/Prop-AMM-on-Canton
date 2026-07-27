@@ -1,0 +1,167 @@
+-- Tests for the prop AMM slot pattern.
+--
+-- The interesting part of this script is `discloseMany`: it is the Daml Script
+-- equivalent of what the trader's client does in production when it attaches
+-- `disclosedContracts` to a Ledger API command. If you delete the disclose
+-- options, the swaps fail with a visibility error -- which is the point. The
+-- taker sees the slot and its single earmarked holding, and nothing else.
+
+module PropAmmTests where
+
+import Daml.Script
+import DA.Time
+import PropAmm
+
+-- Two traders swap against two different slots. Nothing archived by one
+-- transaction is touched by the other, so on a real ledger these commit in
+-- parallel with no ContentionOnSharedResources rejection.
+testParallelSwaps : Script ()
+testParallelSwaps = script do
+  admin    <- allocateParty "Admin"
+  baseReg  <- allocateParty "BaseRegistrar"
+  quoteReg <- allocateParty "QuoteRegistrar"
+  alice    <- allocateParty "Alice"
+  bob      <- allocateParty "Bob"
+
+  now <- getTime
+  let slotExpiry = addRelTime now (minutes 5)
+      entExpiry  = addRelTime now (days 30)
+      poolId     = "CBT/USD"
+
+  reserve <- submit baseReg do
+    createCmd Holding with
+      registrar = baseReg; owner = admin; symbol = "CBT"; amount = 10000.0
+
+  aliceCash <- submit quoteReg do
+    createCmd Holding with
+      registrar = quoteReg; owner = alice; symbol = "USD"; amount = 5000.0
+
+  bobCash <- submit quoteReg do
+    createCmd Holding with
+      registrar = quoteReg; owner = bob; symbol = "USD"; amount = 5000.0
+
+  rules <- submit admin do
+    createCmd PoolRules with admin; poolId
+
+  aliceEnt <- submit admin do
+    createCmd TraderEntitlement with
+      admin; trader = alice; poolId
+      maxNotionalPerSwap = 100000.0; expiresAt = entExpiry
+
+  bobEnt <- submit admin do
+    createCmd TraderEntitlement with
+      admin; trader = bob; poolId
+      maxNotionalPerSwap = 100000.0; expiresAt = entExpiry
+
+  -- Replenisher mints a ladder of fixed-size slots, off the trade path.
+  m1 <- submit admin do
+    exerciseCmd rules PoolRules_MintSlot with
+      slotId = "s1"; reserveHoldingCid = reserve; offerAmount = 1000.0
+      wantSymbol = "USD"; price = 1.05; expiresAt = slotExpiry; reservedFor = None
+
+  Some remainder1 <- pure m1.reserveRemainder
+
+  m2 <- submit admin do
+    exerciseCmd rules PoolRules_MintSlot with
+      slotId = "s2"; reserveHoldingCid = remainder1; offerAmount = 1000.0
+      wantSymbol = "USD"; price = 1.05; expiresAt = slotExpiry; reservedFor = None
+
+  -- What the admin's off-ledger disclosure endpoint hands out per slot.
+  Some slot1Disc  <- queryDisclosure admin m1.slot
+  Some offer1Disc <- queryDisclosure admin m1.offerHoldingCid
+  Some slot2Disc  <- queryDisclosure admin m2.slot
+  Some offer2Disc <- queryDisclosure admin m2.offerHoldingCid
+
+  -- Alice swaps. No admin submission anywhere in this transaction.
+  _ <- submitWithOptions (actAs alice <> discloseMany [slot1Disc, offer1Disc]) do
+    exerciseCmd m1.slot LiquiditySlot_Swap with
+      taker = alice; entitlementCid = aliceEnt
+      payHoldingCid = aliceCash; maxPay = 1100.0
+
+  -- Bob swaps against a different slot.
+  _ <- submitWithOptions (actAs bob <> discloseMany [slot2Disc, offer2Disc]) do
+    exerciseCmd m2.slot LiquiditySlot_Swap with
+      taker = bob; entitlementCid = bobEnt
+      payHoldingCid = bobCash; maxPay = 1100.0
+
+  pure ()
+
+-- A stale or mispriced slot cannot be picked off: the taker's maxPay bound is
+-- checked on-ledger.
+testSlippageBoundRejects : Script ()
+testSlippageBoundRejects = script do
+  admin    <- allocateParty "Admin"
+  baseReg  <- allocateParty "BaseRegistrar"
+  quoteReg <- allocateParty "QuoteRegistrar"
+  alice    <- allocateParty "Alice"
+
+  now <- getTime
+  let poolId = "CBT/USD"
+
+  reserve <- submit baseReg do
+    createCmd Holding with
+      registrar = baseReg; owner = admin; symbol = "CBT"; amount = 10000.0
+  aliceCash <- submit quoteReg do
+    createCmd Holding with
+      registrar = quoteReg; owner = alice; symbol = "USD"; amount = 5000.0
+  rules <- submit admin do createCmd PoolRules with admin; poolId
+  aliceEnt <- submit admin do
+    createCmd TraderEntitlement with
+      admin; trader = alice; poolId
+      maxNotionalPerSwap = 100000.0; expiresAt = addRelTime now (days 30)
+
+  m <- submit admin do
+    exerciseCmd rules PoolRules_MintSlot with
+      slotId = "s1"; reserveHoldingCid = reserve; offerAmount = 1000.0
+      wantSymbol = "USD"; price = 1.05
+      expiresAt = addRelTime now (minutes 5); reservedFor = None
+
+  Some slotDisc  <- queryDisclosure admin m.slot
+  Some offerDisc <- queryDisclosure admin m.offerHoldingCid
+
+  -- Quote costs 1050.0; Alice will not pay more than 1000.0.
+  submitMustFail (actAs alice <> discloseMany [slotDisc, offerDisc]) do
+    exerciseCmd m.slot LiquiditySlot_Swap with
+      taker = alice; entitlementCid = aliceEnt
+      payHoldingCid = aliceCash; maxPay = 1000.0
+
+-- Disclosure is not authority. Mallory can be handed the blobs and still
+-- cannot swap, because she has no entitlement of her own.
+testNonWhitelistedRejects : Script ()
+testNonWhitelistedRejects = script do
+  admin    <- allocateParty "Admin"
+  baseReg  <- allocateParty "BaseRegistrar"
+  quoteReg <- allocateParty "QuoteRegistrar"
+  alice    <- allocateParty "Alice"
+  mallory  <- allocateParty "Mallory"
+
+  now <- getTime
+  let poolId = "CBT/USD"
+
+  reserve <- submit baseReg do
+    createCmd Holding with
+      registrar = baseReg; owner = admin; symbol = "CBT"; amount = 10000.0
+  malloryCash <- submit quoteReg do
+    createCmd Holding with
+      registrar = quoteReg; owner = mallory; symbol = "USD"; amount = 5000.0
+  rules <- submit admin do createCmd PoolRules with admin; poolId
+  aliceEnt <- submit admin do
+    createCmd TraderEntitlement with
+      admin; trader = alice; poolId
+      maxNotionalPerSwap = 100000.0; expiresAt = addRelTime now (days 30)
+
+  m <- submit admin do
+    exerciseCmd rules PoolRules_MintSlot with
+      slotId = "s1"; reserveHoldingCid = reserve; offerAmount = 1000.0
+      wantSymbol = "USD"; price = 1.05
+      expiresAt = addRelTime now (minutes 5); reservedFor = None
+
+  Some slotDisc  <- queryDisclosure admin m.slot
+  Some offerDisc <- queryDisclosure admin m.offerHoldingCid
+  Some entDisc   <- queryDisclosure admin aliceEnt
+
+  -- Mallory presents Alice's entitlement. Rejected: entitlement.trader /= taker.
+  submitMustFail (actAs mallory <> discloseMany [slotDisc, offerDisc, entDisc]) do
+    exerciseCmd m.slot LiquiditySlot_Swap with
+      taker = mallory; entitlementCid = aliceEnt
+      payHoldingCid = malloryCash; maxPay = 1100.0
