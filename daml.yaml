@@ -1,0 +1,12 @@
+sdk-version:
+name: prop-amm-workflows
+version: 1.0.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+# When you replace the stand-in Holding with Token Standard V2, add the Splice DARs here (data-dependencies, never dependencies):
+# data-dependencies:
+#   - ../vendor/splice-api-token-holding-v2-current.dar
+#   - ../vendor/splice-api-token-transfer-instruction-v1-current.dar
+#   - ../vendor/splice-api-token-allocation-v1-current.dar
