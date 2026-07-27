@@ -1,29 +1,5 @@
--- Prop AMM on Canton: pre-published, single-use liquidity slots.
---
--- Design goals this module encodes:
---   1. Traders never see aggregate reserves, the pricing config, or each other.
---      They only ever receive (via explicit disclosure) the slot they are about
---      to consume plus the single earmarked holding backing it.
---   2. No admin application is in the trade path. Admin authority is baked into
---      the slot at mint time (delegation pattern), so the trader submits the
---      swap unilaterally from their own participant node.
---   3. Swaps are contention-free. Each swap archives exactly one slot, one
---      earmarked admin holding, and the trader's own payment holding. Two
---      traders on two different slots share no archived contract, so they
---      commit in parallel.
---
--- The Holding template here is a stand-in so this module is self-contained.
--- In production, replace it with Splice Token Standard V2 (CIP-0056) Holding /
--- TransferFactory calls and add the token-standard DARs under
--- `data-dependencies` in daml.yaml. The authorization shape does not change.
-
 module PropAmm where
-
 import DA.Time (assertWithinDeadline)
-
--- ---------------------------------------------------------------------------
--- Result types
--- ---------------------------------------------------------------------------
 
 data HoldingSplitResult = HoldingSplitResult
   with
@@ -38,19 +14,12 @@ data SwapResult = SwapResult
     takerChange : Optional (ContractId Holding)
   deriving (Eq, Show)
 
--- Both cids in here are exactly what the admin's disclosure endpoint must
--- serve for this slot. Anything the taker's transaction touches has to be in
--- their participant's contract store, so a slot is never disclosable alone.
 data MintResult = MintResult
   with
     slot             : ContractId LiquiditySlot
     offerHoldingCid  : ContractId Holding
     reserveRemainder : Optional (ContractId Holding)
   deriving (Eq, Show)
-
--- ---------------------------------------------------------------------------
--- Holding (replace with Token Standard V2 Holding in production)
--- ---------------------------------------------------------------------------
 
 template Holding
   with
@@ -63,9 +32,6 @@ template Holding
     observer  owner
     ensure amount > 0.0
 
-    -- Splitting and transferring are the same operation. Passing
-    -- `newOwner == owner` is a pure split, used by the admin when earmarking
-    -- a slot out of the main reserve.
     choice Holding_SplitTransfer : HoldingSplitResult
       with
         newOwner       : Party
@@ -83,12 +49,6 @@ template Holding
             else pure None
         pure HoldingSplitResult with transferred; remainder
 
--- ---------------------------------------------------------------------------
--- Whitelist token (pattern 3). Trader is an observer, so this is visible to
--- them natively -- it never needs to be disclosed, and revoking it is a single
--- admin-side archive that takes effect immediately.
--- ---------------------------------------------------------------------------
-
 template TraderEntitlement
   with
     admin               : Party
@@ -105,11 +65,6 @@ template TraderEntitlement
       controller admin
       do return ()
 
--- ---------------------------------------------------------------------------
--- Immutable pool config. Never disclosed to traders, never archived in the
--- swap path, so it can never be a contention point.
--- ---------------------------------------------------------------------------
-
 template PoolConfig
   with
     admin      : Party
@@ -120,12 +75,6 @@ template PoolConfig
   where
     signatory admin
     ensure feeBps >= 0
-
--- ---------------------------------------------------------------------------
--- Capability contract (pattern 9). Pure permission grant, no mutable state,
--- every choice nonconsuming. The admin's replenisher uses this to batch-mint
--- slots out of the main reserve. This runs OFF the trade path.
--- ---------------------------------------------------------------------------
 
 template PoolRules
   with
@@ -150,8 +99,6 @@ template PoolRules
         reserve <- fetch reserveHoldingCid
         assertMsg "reserve not owned by admin" (reserve.owner == admin)
 
-        -- Earmark exactly offerAmount out of the reserve. The taker will only
-        -- ever be shown this child holding, never the reserve itself.
         split <- exercise reserveHoldingCid Holding_SplitTransfer with
           newOwner = admin
           transferAmount = offerAmount
@@ -174,15 +121,6 @@ template PoolRules
           offerHoldingCid  = split.transferred
           reserveRemainder = split.remainder
 
--- ---------------------------------------------------------------------------
--- The disclosed artifact. Single-use, fixed size, fixed price, short TTL.
---
--- Mint a ladder of sizes (e.g. 100 / 500 / 1000 / 5000) rather than supporting
--- partial fills: a partial fill would force the admin to re-mint and re-publish
--- a new disclosure blob mid-flight, which is exactly the round trip this design
--- is trying to eliminate.
--- ---------------------------------------------------------------------------
-
 template LiquiditySlot
   with
     admin           : Party
@@ -200,10 +138,6 @@ template LiquiditySlot
     signatory admin
     ensure offerAmount > 0.0 && price > 0.0 && offerSymbol /= wantSymbol
 
-    -- The whole design hinges on this choice. `taker` is a choice argument, so
-    -- any party can attempt it; the entitlement fetch is what actually gates
-    -- access. Admin's authority for the delivery leg comes from admin being
-    -- the signatory of THIS contract -- no admin submission required.
     choice LiquiditySlot_Swap : SwapResult
       with
         taker          : Party
@@ -212,9 +146,6 @@ template LiquiditySlot
         maxPay         : Decimal   -- taker's protection against a stale quote
       controller taker
       do
-        -- Prefer assertWithinDeadline over getTime: getTime pins the
-        -- transaction to a ~1 minute ledger-time window, which breaks
-        -- externally signed submissions.
         assertWithinDeadline "slot" expiresAt
 
         entitlement <- fetch entitlementCid
@@ -242,13 +173,10 @@ template LiquiditySlot
              && offerHolding.symbol == offerSymbol
              && offerHolding.amount == offerAmount)
 
-        -- Leg 1: taker pays. Authorized by taker as the choice actor.
         payment <- exercise payHoldingCid Holding_SplitTransfer with
           newOwner = admin
           transferAmount = payAmount
 
-        -- Leg 2: admin delivers. Authorized because admin signs this slot, so
-        -- admin's authority is in scope for the choice's consequences.
         delivery <- exercise offerHoldingCid Holding_SplitTransfer with
           newOwner = taker
           transferAmount = offerAmount
@@ -258,8 +186,6 @@ template LiquiditySlot
           paid        = payment.transferred
           takerChange = payment.remainder
 
-    -- Reclaim. Archives the slot; the replenisher folds offerHoldingCid back
-    -- into the main reserve in a separate, admin-only transaction.
     choice LiquiditySlot_Cancel : ContractId Holding
       controller admin
       do pure offerHoldingCid
